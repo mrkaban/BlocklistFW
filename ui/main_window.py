@@ -270,6 +270,11 @@ class MainWindow(QMainWindow):
         table.doubleClicked.connect(self.on_rule_double_click)  # открытие окна по двойному клику
         # Встроенная сортировка по клику на заголовки
         table.setSortingEnabled(True)
+        # Явно включаем кликабельность секций и индикатор сортировки.
+        # В некоторых версиях PySide6 setSortingEnabled(True) не восстанавливает
+        # sectionsClickable, из-за чего клик по заголовку не запускает сортировку.
+        smart_header.setSectionsClickable(True)
+        smart_header.setSortIndicatorShown(True)
 
     def init_rules_tab(self):
         """Инициализация вкладки с правилами."""
@@ -993,6 +998,9 @@ class MainWindow(QMainWindow):
             table.setItem(row, 6, QTableWidgetItem(remote_addrs))
             table.setItem(row, 7, QTableWidgetItem("Да" if rule.enabled else "Нет"))
         table.setSortingEnabled(was_sorting)
+        # После переключения сортировки повторно гарантируем кликабельность заголовков,
+        # т.к. setSortingEnabled(False)->(True) вновь сбрасывает sectionsClickable.
+        table.horizontalHeader().setSectionsClickable(True)
         table.setUpdatesEnabled(True)
         table.viewport().update()
 
@@ -1886,27 +1894,28 @@ class MainWindow(QMainWindow):
         self.load_threat_entries_table()
 
     def on_apply_threat_rules(self):
-        """Применение правил блокировки (группировка или отдельные правила) с живым прогрессом."""
+        """Применение правил блокировки (группировка) с живым прогрессом."""
         from PySide6.QtWidgets import (
             QMessageBox, QDialog, QApplication, QPlainTextEdit,
             QProgressBar, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
         )
         from PySide6.QtCore import Qt
 
-        # Диалог выбора метода
-        reply = QMessageBox.question(
-            self, "Выбор метода",
+        # Диалог выбора метода: либо группировка, либо отмена операции.
+        # Используем русскоязычные кнопки вместо стандартных Yes/No/Cancel.
+        method_box = QMessageBox(self)
+        method_box.setIcon(QMessageBox.Question)
+        method_box.setWindowTitle("Выбор метода")
+        method_box.setText(
             "Создать правила блокировки для всех записей угроз.\n"
-            f"Найдено записей: {len(self.threat_manager.get_entries())}\n\n"
-            "Выберите метод:\n"
-            "• Да - использовать группировку (рекомендуется для >100 записей)\n"
-            "• Нет - создавать отдельные правила для каждой записи\n"
-            "• Отмена - отменить операцию",
-            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+            f"Найдено записей: {len(self.threat_manager.get_entries())}"
         )
-        if reply == QMessageBox.Cancel:
+        grouping_btn = method_box.addButton("Да - использовать группировку", QMessageBox.YesRole)
+        method_box.addButton("Нет - отменить операцию", QMessageBox.NoRole)
+        method_box.setDefaultButton(grouping_btn)
+        method_box.exec()
+        if method_box.clickedButton() != grouping_btn:
             return
-        use_grouping = (reply == QMessageBox.Yes)
 
         entries = self.threat_manager.get_entries()
         if not entries:
@@ -1996,123 +2005,68 @@ class MainWindow(QMainWindow):
             applied += 1
             append_log(f"Добавлено правило: {rule_name}")
 
-        if use_grouping:
-            # Подготовка: резолвим домены и распределяем записи по источникам
-            resolved_entries = []
-            total = len(entries)
-            for i, entry in enumerate(entries):
-                update_progress(i / max(total, 1) * 20)  # фаза подготовки: 0..20%
-                if not entry.ip and not entry.cidr and not entry.domain:
-                    skipped += 1
-                    continue
-                if entry.domain and not entry.resolved_ips:
-                    try:
-                        resolved = self.domain_resolver.resolve(entry.domain)
-                        if resolved:
-                            entry.resolved_ips = resolved
-                        else:
-                            skipped += 1
-                            continue
-                    except Exception as e:
-                        logger.error(f"Ошибка резолвинга домена {entry.domain}: {e}")
-                        errors += 1
-                        continue
-                resolved_entries.append(entry)
-                QApplication.processEvents()
-
-            from collections import defaultdict
-            entries_by_feed = defaultdict(list)
-            for entry in resolved_entries:
-                entries_by_feed[entry.feed_id].append(entry)
-
-            update_progress(25)
-            for feed_id, feed_entries in entries_by_feed.items():
-                feed = self.threat_manager.get_feed_by_id(feed_id)
-                if not feed:
-                    skipped += len(feed_entries)
-                    continue
+        # Подготовка: резолвим домены и распределяем записи по источникам
+        resolved_entries = []
+        total = len(entries)
+        for i, entry in enumerate(entries):
+            update_progress(i / max(total, 1) * 20)  # фаза подготовки: 0..20%
+            if not entry.ip and not entry.cidr and not entry.domain:
+                skipped += 1
+                continue
+            if entry.domain and not entry.resolved_ips:
                 try:
-                    _ok, _sk = self.rule_generator.apply_grouped_rules(
-                        feed_entries, feed,
-                        existing_names=existing_names,
-                        on_rule_added=on_rule_added,
-                    )
-                    skipped_existing += _sk
-                except Exception as e:
-                    logger.error(f"Ошибка применения группированных правил для источника {feed.name}: {e}")
-                    errors += len(feed_entries)
-                append_log(f"Источник «{feed.name}» обработан")
-                QApplication.processEvents()
-
-            # Обновляем таблицы, пока диалог ещё открыт
-            update_progress(95)
-            try:
-                self.load_rules()
-            except Exception:
-                pass
-            update_progress(100)
-            dlg.accept()
-            msg = (f"Применение правил завершено.\n"
-                   f"Создано новых правил: {applied}\n"
-                   f"Уже существовало (пропущено): {skipped_existing}\n"
-                   f"Пропущено записей без адреса: {skipped}\n"
-                   f"Ошибок: {errors}")
-            QMessageBox.information(self, "Результат", msg)
-            logger.info(f"Группированные правила: applied={applied}, skipped={skipped}, errors={errors}")
-        else:
-            # Отдельные правила для каждой записи
-            total = len(entries)
-            for i, entry in enumerate(entries):
-                update_progress(i / max(total, 1) * 90)  # основная фаза: 0..90%
-                feed = self.threat_manager.get_feed_by_id(entry.feed_id)
-                if not feed:
-                    skipped += 1
-                    continue
-                if not entry.ip and not entry.cidr and not entry.domain:
-                    skipped += 1
-                    continue
-                if entry.domain and not entry.resolved_ips:
-                    try:
-                        resolved = self.domain_resolver.resolve(entry.domain)
-                        if resolved:
-                            entry.resolved_ips = resolved
-                        else:
-                            skipped += 1
-                            continue
-                    except Exception as e:
-                        logger.error(f"Ошибка резолвинга домена {entry.domain}: {e}")
-                        errors += 1
-                        continue
-                try:
-                    success, _sk = self.rule_generator.apply_entry(
-                        entry, feed,
-                        existing_names=existing_names,
-                        on_rule_added=on_rule_added,
-                    )
-                    skipped_existing += _sk
-                    if not success and _sk == 0:
+                    resolved = self.domain_resolver.resolve(entry.domain)
+                    if resolved:
+                        entry.resolved_ips = resolved
+                    else:
                         skipped += 1
+                        continue
                 except Exception as e:
-                    logger.error(f"Ошибка применения правила для записи {entry.id}: {e}")
+                    logger.error(f"Ошибка резолвинга домена {entry.domain}: {e}")
                     errors += 1
-                QApplication.processEvents()
+                    continue
+            resolved_entries.append(entry)
+            QApplication.processEvents()
 
-            # Обновляем таблицы, пока диалог ещё открыт
-            update_progress(95)
+        from collections import defaultdict
+        entries_by_feed = defaultdict(list)
+        for entry in resolved_entries:
+            entries_by_feed[entry.feed_id].append(entry)
+
+        update_progress(25)
+        for feed_id, feed_entries in entries_by_feed.items():
+            feed = self.threat_manager.get_feed_by_id(feed_id)
+            if not feed:
+                skipped += len(feed_entries)
+                continue
             try:
-                self.load_rules()
-            except Exception:
-                pass
-            update_progress(100)
-            dlg.accept()
-            msg = (f"Применение правил завершено.\n"
-                   f"Создано новых правил: {applied}\n"
-                   f"Уже существовало (пропущено): {skipped_existing}\n"
-                   f"Пропущено записей без адреса: {skipped}\n"
-                   f"Ошибок: {errors}")
-            QMessageBox.information(self, "Результат", msg)
-            logger.info(f"Индивидуальные правила: applied={applied}, skipped={skipped}, errors={errors}")
+                _ok, _sk = self.rule_generator.apply_grouped_rules(
+                    feed_entries, feed,
+                    existing_names=existing_names,
+                    on_rule_added=on_rule_added,
+                )
+                skipped_existing += _sk
+            except Exception as e:
+                logger.error(f"Ошибка применения группированных правил для источника {feed.name}: {e}")
+                errors += len(feed_entries)
+            append_log(f"Источник «{feed.name}» обработан")
+            QApplication.processEvents()
 
+        # Обновляем таблицы, пока диалог ещё открыт
+        update_progress(95)
+        try:
+            self.load_rules()
+        except Exception:
+            pass
+        update_progress(100)
+        dlg.accept()
+        msg = (f"Применение правил завершено.\n"
+               f"Создано новых правил: {applied}\n"
+               f"Уже существовало (пропущено): {skipped_existing}\n"
+               f"Пропущено записей без адреса: {skipped}\n"
+               f"Ошибок: {errors}")
+        QMessageBox.information(self, "Результат", msg)
+        logger.info(f"Группированные правила: applied={applied}, skipped={skipped}, errors={errors}")
     def on_clear_dns_cache(self):
         """Очистка кэша DNS."""
         try:
